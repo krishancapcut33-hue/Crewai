@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+import importlib
 from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
 
 from click.testing import CliRunner
+import pytest
 from pytest import MonkeyPatch
 import tomli
 
@@ -86,3 +91,120 @@ def test_scaffolded_flow_agents_md_tells_assistants_to_evaluate_with_crewai_eval
     for agents_md in (python_flow, declared):
         assert "{{name}}" not in agents_md
         assert "crewai-eval:" not in agents_md
+
+
+@pytest.fixture
+def scaffolded_flow_main(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> Iterator[ModuleType]:
+    """The real `crewai create flow` main.py, with its crew replaced by a fake that
+    echoes the topic, so the flow runs end to end without an LLM."""
+    monkeypatch.chdir(tmp_path)
+    create_flow("Demo Flow")
+    monkeypatch.chdir(tmp_path / "demo_flow")
+    monkeypatch.syspath_prepend(str(tmp_path / "demo_flow" / "src"))
+
+    main = importlib.import_module("demo_flow.main")
+
+    class FakeCrew:
+        def kickoff(self, inputs: dict[str, str]) -> SimpleNamespace:
+            return SimpleNamespace(raw=f"post about {inputs['topic']}")
+
+    class FakeContentCrew:
+        def crew(self) -> FakeCrew:
+            return FakeCrew()
+
+    monkeypatch.setattr(main, "ContentCrew", FakeContentCrew)
+    yield main
+    # Only the project's own modules: re-importing a native extension such as
+    # lancedb after dropping it from sys.modules panics.
+    for name in [m for m in sys.modules if m.split(".")[0] == "demo_flow"]:
+        del sys.modules[name]
+
+
+def _written_post() -> str:
+    return Path("output/post.md").read_text(encoding="utf-8")
+
+
+def test_scaffolded_flow_kickoff_runs_with_json_inputs_from_argv(
+    scaffolded_flow_main: ModuleType, monkeypatch: MonkeyPatch
+):
+    monkeypatch.setattr(sys, "argv", ["kickoff", '{"topic": "Quantum"}'])
+
+    scaffolded_flow_main.kickoff()
+
+    assert _written_post() == "post about Quantum"
+
+
+def test_scaffolded_flow_kickoff_without_inputs_uses_default_topic(
+    scaffolded_flow_main: ModuleType, monkeypatch: MonkeyPatch
+):
+    monkeypatch.setattr(sys, "argv", ["kickoff"])
+
+    scaffolded_flow_main.kickoff()
+
+    assert _written_post() == "post about AI Agents"
+
+
+@pytest.mark.parametrize(
+    ("argv_inputs", "message"),
+    [
+        ("{bad", r"Invalid inputs JSON: Expecting property name"),
+        ("[1]", r"Invalid inputs: expected a JSON object\."),
+        ('"Quantum"', r"Invalid inputs: expected a JSON object\."),
+    ],
+)
+def test_scaffolded_flow_kickoff_rejects_inputs_that_are_not_a_json_object(
+    scaffolded_flow_main: ModuleType,
+    monkeypatch: MonkeyPatch,
+    argv_inputs: str,
+    message: str,
+):
+    monkeypatch.setattr(sys, "argv", ["kickoff", argv_inputs])
+
+    with pytest.raises(SystemExit, match=message) as exc_info:
+        scaffolded_flow_main.kickoff()
+
+    assert """uv run kickoff '{"topic": "AI Agents"}'""" in str(exc_info.value)
+    assert not Path("output/post.md").exists()
+
+
+def test_scaffolded_flow_start_step_keeps_inputs_passed_to_flow_kickoff(
+    scaffolded_flow_main: ModuleType,
+):
+    # AMP calls `YourFlow().kickoff(inputs=...)` directly, not main.py's kickoff().
+    scaffolded_flow_main.ContentFlow().kickoff(inputs={"topic": "Robots"})
+
+    assert _written_post() == "post about Robots"
+
+
+def test_scaffolded_flow_run_with_trigger_uses_payload_topic(
+    scaffolded_flow_main: ModuleType, monkeypatch: MonkeyPatch
+):
+    monkeypatch.setattr(sys, "argv", ["run_with_trigger", '{"topic": "Rockets"}'])
+
+    scaffolded_flow_main.run_with_trigger()
+
+    assert _written_post() == "post about Rockets"
+
+
+def test_scaffolded_flow_run_with_trigger_without_topic_keeps_default(
+    scaffolded_flow_main: ModuleType, monkeypatch: MonkeyPatch
+):
+    monkeypatch.setattr(sys, "argv", ["run_with_trigger", '{"source": "slack"}'])
+
+    scaffolded_flow_main.run_with_trigger()
+
+    assert _written_post() == "post about AI Agents"
+
+
+def test_scaffolded_flow_docs_tell_how_to_pass_inputs(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    create_flow("Demo Flow")
+
+    agents_md = (tmp_path / "demo_flow" / "AGENTS.md").read_text(encoding="utf-8")
+    readme = (tmp_path / "demo_flow" / "README.md").read_text(encoding="utf-8")
+    assert "`uv run kickoff '{\"topic\":\"...\"}'`" in agents_md
+    assert "uv run kickoff '{\"topic\": \"Quantum Computing\"}'" in readme

@@ -981,6 +981,12 @@ uv run kickoff
 
 O flow será executado, e você verá a saída no console.
 
+Para executar o flow com outros inputs, passe-os como um objeto JSON. O `kickoff()` gerado em `main.py` lê esse JSON do seu primeiro argumento e o repassa para `kickoff(inputs=...)`, que define os campos de estado correspondentes:
+
+```bash
+uv run kickoff '{"topic": "Quantum Computing"}'
+```
+
 ## Plotando Flows
 
 Visualizar seus fluxos de trabalho de IA proporciona insights valiosos sobre a estrutura e os caminhos de execução dos flows. O CrewAI oferece uma ferramenta de visualização poderosa que permite gerar plots interativos dos flows, facilitando o entendimento e a otimização dos workflows de IA.
