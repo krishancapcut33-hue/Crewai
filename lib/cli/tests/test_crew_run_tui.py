@@ -46,6 +46,7 @@ from crewai_cli.crew_run_tui import (
 import httpx
 import pytest
 from rich.text import Text
+from textual.pilot import Pilot
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +91,18 @@ def _emit_event(event: object) -> None:
     future = crewai_event_bus.emit(None, event)
     if future:
         future.result(timeout=5)
+
+
+# Long enough that a loaded xdist worker still sees the subscription right after the
+# save completes; the unsubscribe is then polled for instead of awaited for a fixed time.
+_MEMORY_SAVE_TEST_GRACE_SECONDS = 0.5
+
+
+async def _unsubscribes_within(app: CrewRunApp, pilot: Pilot, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while app._event_handlers and time.monotonic() < deadline:
+        await pilot.pause(0.05)
+    return not app._event_handlers
 
 
 def test_chain_deploy_skips_validation_after_auth_retry(monkeypatch) -> None:
@@ -1593,7 +1606,8 @@ async def test_crew_done_keeps_memory_save_subscription_until_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "crewai_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS", 0.05
+        "crewai_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS",
+        _MEMORY_SAVE_TEST_GRACE_SECONDS,
     )
     app = _app_with_plan()
     auto_unsubscribed = False
@@ -1626,8 +1640,7 @@ async def test_crew_done_keeps_memory_save_subscription_until_completion(
             await pilot.pause()
 
             assert app._event_handlers
-            await pilot.pause(0.08)
-            auto_unsubscribed = not app._event_handlers
+            auto_unsubscribed = await _unsubscribes_within(app, pilot, timeout=5.0)
         finally:
             app._unsubscribe()
 
@@ -1644,7 +1657,8 @@ async def test_crew_done_waits_for_queued_memory_save_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "crewai_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS", 0.05
+        "crewai_cli.crew_run_tui._MEMORY_SAVE_DRAIN_GRACE_SECONDS",
+        _MEMORY_SAVE_TEST_GRACE_SECONDS,
     )
     app = _app_with_plan()
     auto_unsubscribed = False
@@ -1681,8 +1695,7 @@ async def test_crew_done_waits_for_queued_memory_save_events(
             await pilot.pause()
 
             assert app._event_handlers
-            await pilot.pause(0.08)
-            auto_unsubscribed = not app._event_handlers
+            auto_unsubscribed = await _unsubscribes_within(app, pilot, timeout=5.0)
         finally:
             app._unsubscribe()
 
