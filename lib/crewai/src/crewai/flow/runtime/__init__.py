@@ -3185,7 +3185,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         Note:
             - Routers are executed sequentially to maintain flow control
-            - Each router's result becomes a new trigger_method
+            - Each router's outcome is matched against downstream routers in turn
             - Normal listeners are executed in parallel for efficiency
             - Listeners can receive the trigger method's result as a parameter
         """
@@ -3195,24 +3195,42 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         router_result_to_feedback: dict[
             str, Any
         ] = {}  # Map outcome -> HumanFeedbackResult
-        current_trigger = trigger_method
         current_result = result  # Track the result to pass to each router
         current_triggering_event_id = triggering_event_id
         # Methods already run per trigger, so a conditional start that also
         # listens to the same event is not run a second time below.
         ran_for_trigger: dict[str, set[FlowMethodName]] = {}
+        # Outcomes still to be matched against downstream routers, in arrival
+        # order, each mapped to the routers upstream of it. Routers fired by one
+        # trigger are siblings, and each outcome continues its own chain.
+        pending_triggers: dict[FlowMethodName, frozenset[FlowMethodName]] = {
+            trigger_method: frozenset()
+        }
+        # Like or_() listeners, a multi-event or_() router runs once per wave,
+        # unless the outcome matching it again comes from its own run (a loop).
+        fired_or_routers: set[FlowMethodName] = set()
 
-        while True:
+        while pending_triggers:
+            current_trigger = next(iter(pending_triggers))
+            upstream_routers = pending_triggers.pop(current_trigger)
             routers_triggered = self._find_triggered_methods(
                 current_trigger, router_only=True
             )
             if not routers_triggered:
-                break
+                continue
             ran_for_trigger.setdefault(str(current_trigger), set()).update(
                 routers_triggered
             )
 
             for router_name in routers_triggered:
+                if (
+                    router_name in fired_or_routers
+                    and router_name not in upstream_routers
+                ):
+                    continue
+                condition = self._listen_condition(router_name)
+                if condition is not None and _is_multi_event_or(condition):
+                    fired_or_routers.add(router_name)
                 # For routers triggered by a router outcome, pass the HumanFeedbackResult
                 router_input = router_result_to_feedback.get(
                     str(current_trigger), current_result
@@ -3224,7 +3242,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     router_name, router_input, current_triggering_event_id
                 )
                 if router_result is None:
-                    current_trigger = FlowMethodName("")
                     continue
 
                 router_result = (
@@ -3245,7 +3262,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     router_result_to_feedback[router_result_str] = (
                         self.last_human_feedback
                     )
-                current_trigger = router_result_event
+                pending_triggers[router_result_event] = (
+                    pending_triggers.get(router_result_event, frozenset())
+                    | upstream_routers
+                    | {router_name}
+                )
 
         all_triggers = [trigger_method, *router_results]
 
