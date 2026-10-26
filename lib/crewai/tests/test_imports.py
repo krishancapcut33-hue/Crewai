@@ -20,10 +20,10 @@ def test_crew_output_import():
     assert CrewOutput is not None
 
 
-# Modules whose namespace `crewai/__init__.py` extends to resolve forward refs.
+# Modules whose namespace `crewai/__init__.py` extends with base_agent's globals
+# to resolve forward refs. base_agent itself is the source, so it is not listed.
 REBUILT_MODULES = [
     "crewai.agent.core",
-    "crewai.agents.agent_builder.base_agent",
     "crewai.agents.agent_executor",
     "crewai.crew",
     "crewai.flow.flow",
