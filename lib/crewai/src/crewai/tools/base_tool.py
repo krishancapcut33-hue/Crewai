@@ -42,6 +42,7 @@ from crewai.tools.tool_failure import ToolFailure, ToolFailurePolicy, ToolFailur
 from crewai.types.callback import (
     SerializableCallable,
     _resolve_dotted_path,
+    _trusted_deserialize,
     callable_to_string,
 )
 from crewai.utilities.string_utils import sanitize_tool_name
@@ -79,11 +80,44 @@ def _resolve_tool_dict(value: dict[str, Any]) -> Any:
             except (ValueError, ImportError):
                 data.pop(key)
 
-    func = data.get("func")
-    if isinstance(func, str):
-        data["func"] = _resolve_tool_func(func)
+    if "func" in data and not callable(data["func"]):
+        data["func"] = _restore_tool_func(data["func"])
 
     return tool_cls.model_validate(data)  # type: ignore[union-attr]
+
+
+_UNRESTORED_FUNC_PATH_ATTR = "__crewai_unrestored_func_path__"
+
+
+def _restore_tool_func(value: Any) -> Callable[..., Any]:
+    """Restore a checkpointed ``Tool.func`` from its serialized dotted path.
+
+    The path is only imported when ``CREWAI_DESERIALIZE_CALLBACKS`` opts in,
+    as for other checkpointed callbacks. Otherwise, or when the function could
+    not be serialized (a lambda or closure), the tool is restored with a
+    placeholder that raises if the tool is run, so restoring the rest of the
+    state still succeeds.
+    """
+    if isinstance(value, str) and _trusted_deserialize():
+        return _resolve_tool_func(value)
+
+    if isinstance(value, str):
+        reason = (
+            f"its function {value!r} was not imported: set "
+            "CREWAI_DESERIALIZE_CALLBACKS=1 to allow it. Only enable this for "
+            "trusted checkpoint data."
+        )
+    else:
+        reason = (
+            "its function could not be serialized. Use a module-level named "
+            "function for checkpointable tools."
+        )
+
+    def _unrestored_func(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"This tool was restored from a checkpoint, but {reason}")
+
+    setattr(_unrestored_func, _UNRESTORED_FUNC_PATH_ATTR, value)
+    return _unrestored_func
 
 
 def _resolve_tool_func(path: str) -> Callable[..., Any]:
@@ -558,6 +592,8 @@ class Tool(BaseTool, Generic[P, R]):
     @field_serializer("func", when_used="json")
     def _serialize_func(self, func: Callable[..., Any]) -> str | None:
         """Serialize the wrapped function as a dotted path for checkpoints."""
+        if hasattr(func, _UNRESTORED_FUNC_PATH_ATTR):
+            return getattr(func, _UNRESTORED_FUNC_PATH_ATTR)  # type: ignore[no-any-return]
         return callable_to_string(func)
 
     def run(self, *args: P.args, **kwargs: P.kwargs) -> R:
