@@ -39,7 +39,11 @@ from crewai.tools.structured_tool import (
     format_description_for_llm,
 )
 from crewai.tools.tool_failure import ToolFailure, ToolFailurePolicy, ToolFailureReason
-from crewai.types.callback import SerializableCallable, _resolve_dotted_path
+from crewai.types.callback import (
+    SerializableCallable,
+    _resolve_dotted_path,
+    callable_to_string,
+)
 from crewai.utilities.string_utils import sanitize_tool_name
 
 
@@ -75,7 +79,29 @@ def _resolve_tool_dict(value: dict[str, Any]) -> Any:
             except (ValueError, ImportError):
                 data.pop(key)
 
+    func = data.get("func")
+    if isinstance(func, str):
+        data["func"] = _resolve_tool_func(func)
+
     return tool_cls.model_validate(data)  # type: ignore[union-attr]
+
+
+def _resolve_tool_func(path: str) -> Callable[..., Any]:
+    """Resolve the serialized dotted path of a ``Tool.func``.
+
+    A function decorated with ``@tool`` is replaced in its module by the
+    ``Tool`` wrapping it, so its dotted path resolves to that tool rather than
+    to a callable. In that case the tool's wrapped function is returned.
+    """
+    module_path, _, name = path.rpartition(".")
+    try:
+        obj = getattr(importlib.import_module(module_path), name)
+    except (ImportError, AttributeError, ValueError):
+        return _resolve_dotted_path(path)
+    inner = getattr(obj, "func", None)
+    if isinstance(obj, BaseTool) and callable(inner):
+        return inner  # type: ignore[no-any-return]
+    return _resolve_dotted_path(path)
 
 
 def _default_cache_function(_args: Any = None, _result: Any = None) -> bool:
@@ -528,6 +554,11 @@ class Tool(BaseTool, Generic[P, R]):
     """
 
     func: Callable[P, R | Awaitable[R]]
+
+    @field_serializer("func", when_used="json")
+    def _serialize_func(self, func: Callable[..., Any]) -> str | None:
+        """Serialize the wrapped function as a dotted path for checkpoints."""
+        return callable_to_string(func)
 
     def run(self, *args: P.args, **kwargs: P.kwargs) -> R:
         """Executes the tool synchronously.
