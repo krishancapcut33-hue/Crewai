@@ -847,6 +847,24 @@ def logout(reset: bool) -> None:
         click.echo("Successfully logged out from CrewAI AMP.")
 
 
+@crewai.command()
+@click.option(
+    "--app",
+    "apps",
+    multiple=True,
+    metavar="SELECTOR",
+    help=(
+        "An integration selector to check, as in `apps=[...]` (e.g. gmail, "
+        "gmail/send_email). Repeat for more than one."
+    ),
+)
+def doctor(apps: tuple[str, ...]) -> None:
+    """Check login, tracing and integrations for this project, one line each."""
+    from crewai_cli.doctor import doctor as run_doctor
+
+    run_doctor(apps)
+
+
 @crewai.group()
 def deploy() -> None:
     """Deploy the Crew CLI group."""
@@ -1378,7 +1396,7 @@ def traces_status() -> None:
     table.add_column("Setting", style="cyan")
     table.add_column("Value", style="white")
 
-    env_enabled = os.getenv("CREWAI_TRACING_ENABLED", "false")
+    env_enabled = os.getenv("CREWAI_TRACING_ENABLED") or "not set"
     table.add_row("CREWAI_TRACING_ENABLED", env_enabled)
 
     trace_consent = user_data.get("trace_consent")

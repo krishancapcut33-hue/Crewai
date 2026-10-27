@@ -1,0 +1,277 @@
+"""`crewai doctor`: the project's CrewAI AMP state, one line per check.
+
+Every check is read-only. The only network call is the GET a crew makes for
+its `apps=[...]` actions, only for selectors named with `--app`, and only to
+an AMP this machine is configured for.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Literal
+import warnings
+
+import click
+from crewai_core.auth.token import AuthError, get_auth_token
+from crewai_core.plus_api import PlusAPI, restore_machine_transport
+from dotenv import dotenv_values
+
+from crewai_cli.config import Settings
+from crewai_cli.experimental.eval_crew import (
+    _encrypted,
+    _origin,
+    _trusted_amp_origins,
+)
+from crewai_cli.run_crew import load_project_env
+from crewai_cli.user_data import has_user_declined_tracing, is_tracing_enabled
+
+
+Status = Literal["ok", "warn", "fail", "skip"]
+Line = tuple[Status, str, str]
+
+TRACING_ENV_VAR = "CREWAI_TRACING_ENABLED"
+INTEGRATION_TOKEN_ENV = "CREWAI_ENTERPRISE_ACTION_AUTH_TOKEN"  # noqa: S105 - a variable name, not a secret
+PAT_ENV = "CREWAI_USER_PAT"
+# What the integrations client's `requests` calls read for TLS, beyond the
+# proxy and CA variables `restore_machine_transport` already pins.
+REQUESTS_TRANSPORT_ENV = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "CREWAI_FACTORY")
+
+
+def _check_login(settings: Settings) -> tuple[Line, bool]:
+    """The login line, and whether a login could be read."""
+    try:
+        get_auth_token()
+    except AuthError:
+        return (
+            "fail",
+            "login",
+            "not logged in (no saved login, or it expired); run `crewai login`",
+        ), False
+    except Exception as error:
+        # Fail closed: a login that exists but cannot be read (a rotated key, a
+        # half-written store) is a failed check. Only the type is printed.
+        return (
+            "fail",
+            "login",
+            f"the saved login could not be read ({type(error).__name__}); "
+            "run `crewai login` again",
+        ), False
+    if not settings.org_uuid:
+        return (
+            "fail",
+            "login",
+            "logged in, but no organization is selected; run `crewai org list`, "
+            "then `crewai org switch <id>`",
+        ), True
+    return (
+        "ok",
+        "login",
+        f"logged in, organization {settings.org_name} ({settings.org_uuid})",
+    ), True
+
+
+def _tracing_credential_source(
+    logged_in: bool,
+) -> Literal["pat", "integration", "login"] | None:
+    """Which credential a run sends with its traces, in the order of
+    `crewai.telemetry.tracing.grants.resolve_tracing_credential`."""
+    if os.environ.get(PAT_ENV):
+        return "pat"
+    if os.environ.get(INTEGRATION_TOKEN_ENV):
+        return "integration"
+    return "login" if logged_in else None
+
+
+def _check_tracing(env_source: str, logged_in: bool, settings: Settings) -> Line:
+    env_value = os.environ.get(TRACING_ENV_VAR, "")
+    enabled = is_tracing_enabled()
+    turned_off_by_env = env_value.lower() in ("false", "0")
+    if turned_off_by_env or env_value.lower() in ("true", "1"):
+        reason = f"{TRACING_ENV_VAR}={env_value} in {env_source}"
+    elif enabled:
+        reason = "consent recorded on this machine"
+    elif has_user_declined_tracing():
+        reason = "declined on this machine"
+    else:
+        reason = "not set; the first run at a terminal asks"
+
+    if not enabled:
+        # Never a failure: off is the person's choice, not the agent's to flip.
+        # `traces enable` only records consent, which an env "false" overrides.
+        fix = (
+            f"setting {TRACING_ENV_VAR}=true in {env_source}"
+            if turned_off_by_env
+            else "running `crewai traces enable`"
+        )
+        return (
+            "warn",
+            "tracing",
+            f"off ({reason}); runs send no traces. Ask the user before {fix}",
+        )
+    host = PlusAPI().base_url.rstrip("/")
+    source = _tracing_credential_source(logged_in)
+    if source == "pat":
+        destination = f"{host} with {PAT_ENV}"
+    elif source == "integration":
+        destination = f"{host} with {INTEGRATION_TOKEN_ENV}"
+    elif source == "login" and settings.org_uuid:
+        destination = f"{host}, organization {settings.org_name}"
+    elif source == "login":
+        destination = f"{host}, no organization selected"
+    else:
+        destination = f"{host} without a login (anonymous)"
+    return "ok", "tracing", f"on ({reason}); traces go to {destination}"
+
+
+def _check_integrations(apps: tuple[str, ...], trusted: set[str]) -> list[Line]:
+    if not apps:
+        return [
+            (
+                "skip",
+                "integration",
+                "no --app given; check a selector with `crewai doctor --app gmail`",
+            )
+        ]
+    if not os.environ.get(INTEGRATION_TOKEN_ENV):
+        return [
+            (
+                "fail",
+                f"integration {app}",
+                f"{INTEGRATION_TOKEN_ENV} is not set in the environment or .env",
+            )
+            for app in apps
+        ]
+    # A project's `.env` may point the check at another AMP, but the token goes
+    # only to one this machine is configured for, over an encrypted connection.
+    base_url = PlusAPI().base_url
+    origin = _origin(base_url)
+    if origin not in trusted or not _encrypted(origin):
+        why = (
+            "is not an AMP this machine is configured for"
+            if origin not in trusted
+            else "would carry the token over plain HTTP"
+        )
+        return [
+            (
+                "fail",
+                f"integration {app}",
+                f"not checked: {base_url} {why}, so {INTEGRATION_TOKEN_ENV} was "
+                "not sent; run `crewai enterprise configure <url>` to check it",
+            )
+            for app in apps
+        ]
+    try:
+        # Importing crewai_tools initializes optional tool SDKs; their
+        # import-time warnings say nothing about this check.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from crewai_tools.tools.crewai_platform_tools.integrations_client import (
+                ApplicationSelector,
+                client_for_selector,
+            )
+        import requests
+    except ImportError:
+        return [
+            (
+                "fail",
+                f"integration {app}",
+                "crewai-tools is not installed for this CLI; run `uv run crewai "
+                "doctor` in a project that depends on crewai[tools]",
+            )
+            for app in apps
+        ]
+
+    lines: list[Line] = []
+    for app in apps:
+        check = f"integration {app}"
+        try:
+            selector = ApplicationSelector.from_string(app)
+        except ValueError as error:
+            lines.append(("fail", check, str(error)))
+            continue
+        # The same two calls `CrewaiPlatformTools` makes for `apps=[...]`.
+        try:
+            actions = client_for_selector(selector, base_url=base_url).get_actions(
+                [selector]
+            )
+        except requests.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status in (401, 403):
+                detail = (
+                    f"{INTEGRATION_TOKEN_ENV} is invalid or expired (HTTP {status})"
+                )
+            else:
+                detail = f"AMP answered HTTP {status}"
+            lines.append(("fail", check, detail))
+            continue
+        except requests.JSONDecodeError:
+            # A subclass of RequestException, but the host did answer.
+            lines.append(
+                (
+                    "fail",
+                    check,
+                    "AMP answered with something that is not JSON; "
+                    "check CREWAI_PLUS_URL",
+                )
+            )
+            continue
+        except requests.RequestException as error:
+            lines.append(
+                ("fail", check, f"could not reach AMP ({type(error).__name__})")
+            )
+            continue
+        except Exception as error:
+            # Fail closed on anything unclassified, such as a response shape
+            # this CLI does not know.
+            lines.append(("fail", check, f"{type(error).__name__}: {error}"))
+            continue
+        if not actions:
+            # AMP answers an empty list for an app it does not know, one that is
+            # not connected, and its own errors alike: the three cannot be told apart.
+            lines.append(
+                (
+                    "fail",
+                    check,
+                    "no actions matched: not connected, misspelled, "
+                    "or AMP could not list it",
+                )
+            )
+        else:
+            slugs = ", ".join(action.action for action in actions)
+            noun = "action" if len(actions) == 1 else "actions"
+            lines.append(("ok", check, f"{len(actions)} {noun}: {slugs}"))
+    return lines
+
+
+def doctor(apps: tuple[str, ...]) -> None:
+    """Print one `<status> <check>: <detail>` line per check; exit 1 on a fail."""
+    # Read before the project's `.env`, which must not choose where the
+    # integration token goes or how it travels there.
+    trusted = _trusted_amp_origins()
+    machine_transport = {key: os.environ.get(key) for key in REQUESTS_TRANSPORT_ENV}
+    env_file = Path.cwd() / ".env"
+    env_source = "the environment"
+    if env_file.is_file():
+        # A key with no value is skipped by load_dotenv, so the shell's stands.
+        if dotenv_values(env_file).get(TRACING_ENV_VAR) is not None:
+            env_source = ".env"
+        load_project_env(env_file)
+        restore_machine_transport(os.environ)
+        for key, value in machine_transport.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    settings = Settings()
+    login_line, logged_in = _check_login(settings)
+    lines = [
+        login_line,
+        _check_tracing(env_source, logged_in, settings),
+        *_check_integrations(apps, trusted),
+    ]
+    for status, check, detail in lines:
+        click.echo(f"{status} {check}: {detail}")
+    if any(status == "fail" for status, _, _ in lines):
+        raise SystemExit(1)
