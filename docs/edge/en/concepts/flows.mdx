@@ -994,6 +994,12 @@ uv run kickoff
 
 The flow will execute, and you should see the output in the console.
 
+To run the flow with other inputs, pass them as a JSON object. The scaffolded `kickoff()` in `main.py` reads that JSON from its first argument and passes it to `kickoff(inputs=...)`, which sets the matching state fields:
+
+```bash
+uv run kickoff '{"topic": "Quantum Computing"}'
+```
+
 ## Plot Flows
 
 Visualizing your AI workflows can provide valuable insights into the structure and execution paths of your flows. CrewAI offers a powerful visualization tool that allows you to generate interactive plots of your flows, making it easier to understand and optimize your AI workflows.

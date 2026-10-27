@@ -1,5 +1,7 @@
 #!/usr/bin/env python
+import json
 from pathlib import Path
+import sys
 
 from pydantic import BaseModel
 
@@ -9,7 +11,7 @@ from {{folder_name}}.crews.content_crew.content_crew import ContentCrew
 
 
 class ContentState(BaseModel):
-    topic: str = ""
+    topic: str = "AI Agents"
     outline: str = ""
     draft: str = ""
     final_post: str = ""
@@ -22,10 +24,8 @@ class ContentFlow(Flow[ContentState]):
         print("Planning content")
 
         if crewai_trigger_payload:
-            self.state.topic = crewai_trigger_payload.get("topic", "AI Agents")
+            self.state.topic = crewai_trigger_payload.get("topic", self.state.topic)
             print(f"Using trigger payload: {crewai_trigger_payload}")
-        else:
-            self.state.topic = "AI Agents"
 
         print(f"Topic: {self.state.topic}")
 
@@ -52,8 +52,20 @@ class ContentFlow(Flow[ContentState]):
 
 
 def kickoff():
+    """
+    Run the flow. Pass inputs as a JSON object: uv run kickoff '{"topic": "..."}'
+    """
+    inputs = None
+    if len(sys.argv) > 1:
+        usage = """Pass inputs as a JSON object, e.g. uv run kickoff '{"topic": "AI Agents"}'"""
+        try:
+            inputs = json.loads(sys.argv[1])
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Invalid inputs JSON: {e}. {usage}") from e
+        if not isinstance(inputs, dict):
+            raise SystemExit(f"Invalid inputs: expected a JSON object. {usage}")
     content_flow = ContentFlow()
-    content_flow.kickoff()
+    content_flow.kickoff(inputs=inputs)
 
 
 def plot():
@@ -65,9 +77,6 @@ def run_with_trigger():
     """
     Run the flow with trigger payload.
     """
-    import json
-    import sys
-
     if len(sys.argv) < 2:
         raise Exception("No trigger payload provided. Please provide JSON payload as argument.")
 

@@ -1217,6 +1217,29 @@ def test_run_crew_runs_python_flow_project(monkeypatch, capsys):
     assert calls == [("kickoff", {"entity_type": "flow"})]
 
 
+def test_run_crew_rejects_inputs_for_python_flow_without_running_it(monkeypatch):
+    # A kickoff() scaffolded before it read argv would drop forwarded inputs and
+    # run on defaults, so `crewai run --inputs` stays a loud error for Python flows.
+    calls = []
+    monkeypatch.setattr(
+        run_crew_module,
+        "read_toml",
+        lambda: {"tool": {"crewai": {"type": "flow"}}},
+    )
+    monkeypatch.setattr(
+        run_crew_module,
+        "_execute_uv_script",
+        lambda script_name, **kwargs: calls.append((script_name, kwargs)),
+    )
+
+    with pytest.raises(
+        click.UsageError, match="--inputs requires a declarative flow definition"
+    ):
+        run_crew_module.run_crew(inputs='{"topic": "Quantum"}')
+
+    assert calls == []
+
+
 def test_run_crew_runs_conversational_flow_tui(monkeypatch, capsys):
     class Flow:
         pass
